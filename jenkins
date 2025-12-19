@@ -1,0 +1,656 @@
+pipeline {
+    agent any
+
+    environment {
+        GIT_REPO_URL = 'https://github.com/Amaldeep98/webhook-test-full.git'
+        REGISTRY = '172.31.12.56:5000'
+        APP_NAME = 'webhook-test'
+        BACKEND_NAME = 'webhook-test-backend'
+        FRONTEND_NAME = 'webhook-test-frontend'
+        // Production environment variables (dummy for testing)
+        PROD_NODE_KEY = '/home/ubuntu/dummy-prod.pem'
+        PROD_NODE_IP = '172.31.7.240'
+        // Staging environment variables (dummy for testing)
+        STAGE_NODE_KEY = '/home/ubuntu/dummy-staging.pem'
+        STAGE_NODE_IP = '172.31.29.148'
+        SLACK_WEBHOOK = '' // Configure in Jenkins environment variables or credentials
+        COMPOSE_FILE = 'docker-compose.yml'
+    }
+
+    triggers {
+        // This ensures Jenkins listens to GitHub webhooks
+        githubPush()
+    }
+
+    options {
+        // Skip automatic SCM checkout - we'll handle it manually after branch detection
+        skipDefaultCheckout()
+    }
+
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['production', 'staging'],
+            description: 'Select environment to build and deploy (for manual builds only; auto-triggered builds use branch: production/staging)'
+        )
+        string(
+            name: 'IMAGE_VERSION',
+            defaultValue: 'latest',
+            description: 'Docker image version tag (e.g. v1.4.2)'
+        )
+    }
+
+    stages {
+        stage('Determine Environment and Branch') {
+            steps {
+                script {
+                    // Debug: Print all available environment variables related to Git/branch
+                    echo "=== Debug: Environment Variables ==="
+                    echo "GIT_BRANCH: ${env.GIT_BRANCH ?: 'NOT SET'}"
+                    echo "BRANCH_NAME: ${env.BRANCH_NAME ?: 'NOT SET'}"
+                    echo "GITHUB_REF: ${env.GITHUB_REF ?: 'NOT SET'}"
+                    echo "BUILD_USER: ${env.BUILD_USER ?: 'NOT SET'}"
+                    echo "CHANGE_BRANCH: ${env.CHANGE_BRANCH ?: 'NOT SET'}"
+                    // List all environment variables that might contain branch info
+                    sh 'env | grep -i -E "(branch|ref|git)" || true'
+                    echo "===================================="
+                    
+                    def isAutoTriggered = false
+                    def branchName = null
+                    
+                    def causes = currentBuild.getBuildCauses()
+                    def isWebhookTrigger = false
+                    def isManualTrigger = false
+                    
+                    // Check build causes - handle JSONObject wrapper
+                    for (cause in causes) {
+                        def causeClass = cause.getClass().toString()
+                        // Safely get description - handle both method and property access
+                        def causeShortDescription = ''
+                        try {
+                            if (cause.respondsTo('getShortDescription')) {
+                                causeShortDescription = cause.getShortDescription() ?: ''
+                            } else if (cause.shortDescription) {
+                                causeShortDescription = cause.shortDescription ?: ''
+                            } else if (cause.get('shortDescription')) {
+                                causeShortDescription = cause.get('shortDescription') ?: ''
+                            }
+                        } catch (Exception e) {
+                            causeShortDescription = ''
+                        }
+                        echo "Build cause: ${causeClass}"
+                        echo "Cause description: ${causeShortDescription}"
+                        
+                        // Check if it's a manual trigger
+                        if (causeClass.contains('UserIdCause') || 
+                            causeClass.contains('UserCause') ||
+                            causeShortDescription.contains('Started by user')) {
+                            isManualTrigger = true
+                            echo "Manual trigger detected"
+                            break
+                        }
+                        
+                        // Check if it's a webhook trigger - check both class name and description
+                        if (causeClass.contains('GitHubPushCause') || 
+                            causeClass.contains('githubPush') ||
+                            causeClass.contains('GitHubHookCause') ||
+                            causeClass.contains('SCMTriggerCause') ||
+                            causeShortDescription.contains('GitHub push') ||
+                            causeShortDescription.contains('Started by GitHub')) {
+                            isWebhookTrigger = true
+                            echo "Webhook trigger detected"
+                            break
+                        }
+                    }
+                    
+                    // Additional check: If BUILD_USER is not set but GIT_BRANCH is, it's likely a webhook
+                    if (!isManualTrigger && !isWebhookTrigger) {
+                        if (!env.BUILD_USER && (env.GIT_BRANCH || env.BRANCH_NAME || env.GITHUB_REF)) {
+                            isWebhookTrigger = true
+                            echo "Webhook trigger detected (no BUILD_USER but Git branch info present)"
+                        } else if (env.BUILD_USER) {
+                            isManualTrigger = true
+                            echo "Manual trigger detected (BUILD_USER is set)"
+                        }
+                    }
+                    
+                    if (isManualTrigger) {
+                        isAutoTriggered = false
+                        branchName = params.ENVIRONMENT == 'staging' ? 'staging' : 'production'
+                        echo "Manual build - using branch: ${branchName}"
+                    } else if (isWebhookTrigger) {
+                        // Auto-triggered build from webhook
+                        isAutoTriggered = true
+                        
+                        // Detect branch from Git - try multiple sources
+                        if (env.GIT_BRANCH) {
+                            branchName = env.GIT_BRANCH.replaceAll('origin/', '').replaceAll('refs/heads/', '')
+                            echo "Branch detected from GIT_BRANCH: ${env.GIT_BRANCH} -> ${branchName}"
+                        } else if (env.BRANCH_NAME) {
+                            branchName = env.BRANCH_NAME
+                            echo "Branch detected from BRANCH_NAME: ${branchName}"
+                        } else if (env.GITHUB_REF) {
+                            branchName = env.GITHUB_REF.replaceAll('refs/heads/', '')
+                            echo "Branch detected from GITHUB_REF: ${env.GITHUB_REF} -> ${branchName}"
+                        } else {
+                            // Last resort: Try to get branch from Git (if repo is already checked out)
+                            // Note: This might not work if no checkout has happened yet
+                            try {
+                                def gitBranch = sh(script: 'git rev-parse --abbrev-ref HEAD 2>/dev/null || echo ""', returnStdout: true).trim()
+                                if (gitBranch && gitBranch != 'HEAD' && gitBranch != '') {
+                                    branchName = gitBranch.replaceAll('origin/', '').replaceAll('remotes/origin/', '')
+                                    echo "Branch detected from Git checkout: ${branchName}"
+                                } else {
+                                    branchName = 'production' // fallback
+                                    echo "WARNING: No branch detected from environment variables or Git, defaulting to production"
+                                    echo "This might indicate a webhook configuration issue"
+                                }
+                            } catch (Exception e) {
+                                branchName = 'production' // fallback
+                                echo "WARNING: Error detecting branch: ${e.message}, defaulting to production"
+                                echo "Please check webhook configuration and ensure branch information is passed correctly"
+                            }
+                        }
+                        echo "Auto-triggered build for branch: ${branchName}"
+                    } else {
+                        // Fallback: Assume manual build if no trigger detected
+                        isAutoTriggered = false
+                        branchName = params.ENVIRONMENT == 'staging' ? 'staging' : 'production'
+                        echo "No trigger detected - assuming manual build with branch: ${branchName}"
+                    }
+                    
+                    // Set deployment environment based on branch
+                    if (isAutoTriggered) {
+                        // For auto-triggered builds, environment matches the branch
+                        if (branchName == 'staging') {
+                            env.DEPLOY_ENV = 'staging'
+                        } else if (branchName == 'production') {
+                            env.DEPLOY_ENV = 'production'
+                        } else {
+                            echo "Auto-triggered build only supports 'production' or 'staging' branches. Branch '${branchName}' detected."
+                            currentBuild.result = 'ABORTED'
+                            error("Build aborted: Unsupported branch for auto-trigger.")
+                        }
+                    } else {
+                        // Manual build - use parameter
+                        env.DEPLOY_ENV = params.ENVIRONMENT ?: 'production'
+                        branchName = env.DEPLOY_ENV == 'staging' ? 'staging' : 'production'
+                    }
+                    
+                    env.SOURCE_BRANCH = branchName
+                    env.IS_AUTO_TRIGGERED = isAutoTriggered.toString()
+                    
+                    echo "=== Build Configuration ==="
+                    echo "Deployment Environment: ${env.DEPLOY_ENV}"
+                    echo "Source Branch: ${branchName}"
+                    echo "Is Auto-Triggered: ${isAutoTriggered}"
+                    echo "=========================="
+                    
+                    // Validate branch/environment match
+                    if (env.DEPLOY_ENV != branchName) {
+                        error("Build aborted: Environment '${env.DEPLOY_ENV}' must match branch '${branchName}'")
+                    }
+                }
+            }
+        }
+
+        stage('SCM Mapping (Webhook Enablement)') {
+            steps {
+                script {
+                    echo "Ensuring Jenkins SCM mapping exists for webhook triggers..."
+                    // Map both branches for webhook recognition
+                    checkout scmGit(
+                        branches: [[name: '*/production'], [name: '*/staging']], // Both branches
+                        extensions: [],
+                        userRemoteConfigs: [[url: "${env.GIT_REPO_URL}", credentialsId: 'moduai-github']]
+                    )
+                    // Note: Update credentialsId if needed for the new repository
+                    echo "SCM mapping completed — webhooks will now trigger this job automatically."
+                }
+            }
+        }
+
+        stage('Notify Build Start') {
+            steps {
+                script {
+                    def envDisplay = env.DEPLOY_ENV.capitalize()
+                    def message = """
+{
+  "text": ":hammer_and_wrench: *${envDisplay} Build Started*",
+  "blocks": [
+    {
+      "type": "header",
+      "text": {
+        "type": "plain_text",
+        "text": ":hammer_and_wrench: ${envDisplay} Build Started"
+      }
+    },
+    {
+      "type": "section",
+      "fields": [
+        {
+          "type": "mrkdwn",
+          "text": "*Job:*\\nwebhook-test-${env.DEPLOY_ENV}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Build:*\\n#${env.BUILD_NUMBER}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Environment:*\\n${envDisplay}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Image Version:*\\n${params.IMAGE_VERSION}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Branch:*\\n${env.SOURCE_BRANCH}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Started By:*\\n${env.BUILD_USER ?: 'Jenkins'}"
+        }
+      ]
+    },
+    {
+      "type": "section",
+      "text":         {
+          "type": "mrkdwn",
+          "text": "*Services to Build:*\\nwebhook-test-backend, webhook-test-frontend (DUMMY)"
+        }
+    },
+    {
+      "type": "context",
+      "elements": [
+        {
+          "type": "mrkdwn",
+          "text": "<${env.BUILD_URL}|View Build>"
+        }
+      ]
+    }
+  ]
+}
+"""
+                    sh """
+                        curl -X POST -H 'Content-type: application/json' \
+                        --data '${message}' \
+                        ${env.SLACK_WEBHOOK} || true
+                    """
+                }
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                script {
+                    echo "Checking out branch: ${env.SOURCE_BRANCH}"
+                    git credentialsId: 'moduai-github',
+                        url: "${env.GIT_REPO_URL}",
+                        branch: env.SOURCE_BRANCH
+                    sh "git branch -a && git log -1 --oneline"
+                    echo "Successfully checked out branch: ${env.SOURCE_BRANCH}"
+                    // Note: Update credentialsId if needed for the new repository
+                }
+            }
+        }
+
+        stage('Docker Build Backend') {
+            steps {
+                script {
+                    def backendImage = "${env.REGISTRY}/${env.BACKEND_NAME}-${env.SOURCE_BRANCH}:${params.IMAGE_VERSION}"
+                    env.BACKEND_IMAGE = backendImage
+                    echo "=== DUMMY BUILD STAGE (Webhook Testing) ==="
+                    echo "Would build backend image: ${backendImage}"
+                    echo "Environment: ${env.DEPLOY_ENV}"
+                    echo "Branch: ${env.SOURCE_BRANCH}"
+                    echo "Image Version: ${params.IMAGE_VERSION}"
+                    echo "Skipping actual Docker build for webhook testing..."
+                    sleep(time: 2, unit: 'SECONDS')
+                    echo "Backend build simulation completed"
+                }
+            }
+        }
+
+        stage('Docker Build Frontend') {
+            steps {
+                script {
+                    def frontendImage = "${env.REGISTRY}/${env.FRONTEND_NAME}-${env.SOURCE_BRANCH}:${params.IMAGE_VERSION}"
+                    env.FRONTEND_IMAGE = frontendImage
+                    echo "=== DUMMY BUILD STAGE (Webhook Testing) ==="
+                    echo "Would build frontend image: ${frontendImage}"
+                    echo "Environment: ${env.DEPLOY_ENV}"
+                    echo "Branch: ${env.SOURCE_BRANCH}"
+                    echo "Image Version: ${params.IMAGE_VERSION}"
+                    
+                    // Use different API URLs based on environment (dummy values)
+                    def apiBaseUrl = env.DEPLOY_ENV == 'staging' ? 'https://dummy-staging-api.example.com/api/v1' : 'https://dummy-prod-api.example.com/api/v1'
+                    echo "Would use API URL: ${apiBaseUrl}"
+                    echo "Skipping actual Docker build for webhook testing..."
+                    sleep(time: 2, unit: 'SECONDS')
+                    echo "Frontend build simulation completed"
+                }
+            }
+        }
+
+        stage('Docker Push') {
+            steps {
+                script {
+                    echo "=== DUMMY PUSH STAGE (Webhook Testing) ==="
+                    echo "Would push backend image: ${env.BACKEND_IMAGE}"
+                    echo "Would push frontend image: ${env.FRONTEND_IMAGE}"
+                    echo "Registry: ${env.REGISTRY}"
+                    echo "Skipping actual Docker push for webhook testing..."
+                    sleep(time: 2, unit: 'SECONDS')
+                    echo "Docker push simulation completed"
+                }
+            }
+        }
+
+        stage('Notify Build Success') {
+            steps {
+                script {
+                    def duration = currentBuild.durationString.replace(' and counting', '')
+                    def envDisplay = env.DEPLOY_ENV.capitalize()
+
+                    def message = """
+{
+  "text": ":white_check_mark: *${envDisplay} Build Successful*",
+  "blocks": [
+    {
+      "type": "header",
+      "text": {
+        "type": "plain_text",
+        "text": ":white_check_mark: ${envDisplay} Build Successful"
+      }
+    },
+    {
+      "type": "section",
+      "fields": [
+        {
+          "type": "mrkdwn",
+          "text": "*Job:*\\nwebhook-test-${env.DEPLOY_ENV}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Build:*\\n#${env.BUILD_NUMBER}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Environment:*\\n${envDisplay}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Image Version:*\\n${params.IMAGE_VERSION}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Duration:*\\n${duration}"
+        }
+      ]
+    },
+    {
+      "type": "section",
+      "text":         {
+          "type": "mrkdwn",
+          "text": "*Built Services:*\\nwebhook-test-backend, webhook-test-frontend (DUMMY)"
+        }
+    },
+    {
+      "type": "context",
+      "elements": [
+        {
+          "type": "mrkdwn",
+          "text": "<${env.BUILD_URL}|View Build>"
+        }
+      ]
+    }
+  ]
+}
+"""
+                    sh """
+                        curl -X POST -H 'Content-type: application/json' \
+                        --data '${message}' \
+                        ${env.SLACK_WEBHOOK} || true
+                    """
+                }
+            }
+        }
+
+        stage('Notify Deployment Start') {
+            steps {
+                script {
+                    def envDisplay = env.DEPLOY_ENV.capitalize()
+                    def message = """
+{
+  "text": ":rocket: *${envDisplay} Deployment Started*",
+  "blocks": [
+    {
+      "type": "header",
+      "text": {
+        "type": "plain_text",
+        "text": ":rocket: ${envDisplay} Deployment Started"
+      }
+    },
+    {
+      "type": "section",
+      "fields": [
+        {
+          "type": "mrkdwn",
+          "text": "*Job:*\\nwebhook-test-${env.DEPLOY_ENV}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Build:*\\n#${env.BUILD_NUMBER}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Environment:*\\n${envDisplay}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Image Version:*\\n${params.IMAGE_VERSION}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Started By:*\\n${env.BUILD_USER ?: 'Jenkins'}"
+        }
+      ]
+    },
+    {
+      "type": "section",
+      "text":         {
+          "type": "mrkdwn",
+          "text": "*Services to Deploy:*\\nwebhook-test-backend, webhook-test-frontend (DUMMY)"
+        }
+    },
+    {
+      "type": "context",
+      "elements": [
+        {
+          "type": "mrkdwn",
+          "text": "<${env.BUILD_URL}|View Build>"
+        }
+      ]
+    }
+  ]
+}
+"""
+                    sh """
+                        curl -X POST -H 'Content-type: application/json' \
+                        --data '${message}' \
+                        ${env.SLACK_WEBHOOK} || true
+                    """
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                script {
+                    echo "=== DUMMY DEPLOY STAGE (Webhook Testing) ==="
+                    if (env.DEPLOY_ENV == 'production') {
+                        echo "Would deploy to Production..."
+                        echo "Production Node IP: ${env.PROD_NODE_IP}"
+                        echo "Production Node Key: ${env.PROD_NODE_KEY}"
+                        echo "Would pull images: ${env.BACKEND_IMAGE}, ${env.FRONTEND_IMAGE}"
+                        echo "Would run: docker compose -f ${env.COMPOSE_FILE} up -d --force-recreate"
+                        echo "Skipping actual deployment for webhook testing..."
+                        sleep(time: 3, unit: 'SECONDS')
+                        echo "Production deployment simulation completed"
+                    } else if (env.DEPLOY_ENV == 'staging') {
+                        echo "Would deploy to Staging..."
+                        echo "Staging Node IP: ${env.STAGE_NODE_IP}"
+                        echo "Staging Node Key: ${env.STAGE_NODE_KEY}"
+                        echo "Would pull images: ${env.BACKEND_IMAGE}, ${env.FRONTEND_IMAGE}"
+                        echo "Would run: docker compose -f ${env.COMPOSE_FILE} up -d --force-recreate"
+                        echo "Skipping actual deployment for webhook testing..."
+                        sleep(time: 3, unit: 'SECONDS')
+                        echo "Staging deployment simulation completed"
+                    } else {
+                        error("Unknown deployment environment: ${env.DEPLOY_ENV}")
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                def duration = currentBuild.durationString.replace(' and counting', '')
+                def envDisplay = env.DEPLOY_ENV ? env.DEPLOY_ENV.capitalize() : 'Production'
+
+                def message = """
+{
+  "text": ":white_check_mark: *${envDisplay} Deployment Successful*",
+  "blocks": [
+    {
+      "type": "header",
+      "text": {
+        "type": "plain_text",
+        "text": ":white_check_mark: ${envDisplay} Deployment Successful"
+      }
+    },
+    {
+      "type": "section",
+      "fields": [
+        {
+          "type": "mrkdwn",
+          "text": "*Job:*\\nwebhook-test-${env.DEPLOY_ENV ?: 'production'}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Build:*\\n#${env.BUILD_NUMBER}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Environment:*\\n${envDisplay}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Image Version:*\\n${params.IMAGE_VERSION}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Duration:*\\n${duration}"
+        }
+      ]
+    },
+    {
+      "type": "section",
+      "text":         {
+          "type": "mrkdwn",
+          "text": "*Deployed Services:*\\nwebhook-test-backend, webhook-test-frontend (DUMMY)"
+        }
+    },
+    {
+      "type": "context",
+      "elements": [
+        {
+          "type": "mrkdwn",
+          "text": "<${env.BUILD_URL}|View Build>"
+        }
+      ]
+    }
+  ]
+}
+"""
+                sh """
+                    curl -X POST -H 'Content-type: application/json' \
+                    --data '${message}' \
+                    ${env.SLACK_WEBHOOK} || true
+                """
+            }
+        }
+
+        failure {
+            script {
+                def duration = currentBuild.durationString.replace(' and counting', '')
+                def envDisplay = env.DEPLOY_ENV ? env.DEPLOY_ENV.capitalize() : 'Production'
+
+                def message = """
+{
+  "text": ":x: *${envDisplay} Pipeline Failed*",
+  "blocks": [
+    {
+      "type": "header",
+      "text": {
+        "type": "plain_text",
+        "text": ":x: ${envDisplay} Pipeline Failed"
+      }
+    },
+    {
+      "type": "section",
+      "fields": [
+        {
+          "type": "mrkdwn",
+          "text": "*Job:*\\nwebhook-test-${env.DEPLOY_ENV ?: 'production'}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Build:*\\n#${env.BUILD_NUMBER}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Environment:*\\n${envDisplay}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Image Version:*\\n${params.IMAGE_VERSION}"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Duration:*\\n${duration}"
+        }
+      ]
+    },
+    {
+      "type": "section",
+      "text":         {
+          "type": "mrkdwn",
+          "text": "*Services:*\\nwebhook-test-backend, webhook-test-frontend (DUMMY)"
+        }
+    },
+    {
+      "type": "context",
+      "elements": [
+        {
+          "type": "mrkdwn",
+          "text": "<${env.BUILD_URL}console|View Console Output>"
+        }
+      ]
+    }
+  ]
+}
+"""
+                sh """
+                    curl -X POST -H 'Content-type: application/json' \
+                    --data '${message}' \
+                    ${env.SLACK_WEBHOOK} || true
+                """
+            }
+        }
+    }
+}
