@@ -77,12 +77,15 @@ pipeline {
                         echo "Staging last commit timestamp: ${stagingDate}"
                         echo "Production last commit timestamp: ${productionDate}"
                         
-                        if (stagingDate && productionDate) {
+                        if (stagingDate && productionDate && stagingDate != '0' && productionDate != '0') {
                             def stagingTime = stagingDate.toLong()
                             def productionTime = productionDate.toLong()
                             // Check which branch was updated more recently (within last 5 minutes to account for webhook delay)
-                            def currentTime = System.currentTimeMillis() / 1000
-                            def timeDiff = Math.abs(currentTime - Math.max(stagingTime, productionTime))
+                            def currentTime = (System.currentTimeMillis() / 1000).toLong()
+                            def maxTime = Math.max(stagingTime, productionTime)
+                            def timeDiff = maxTime > currentTime ? (maxTime - currentTime) : (currentTime - maxTime)
+                            
+                            echo "Current time: ${currentTime}, Max branch time: ${maxTime}, Time difference: ${timeDiff}"
                             
                             if (timeDiff < 300) { // Within 5 minutes
                                 if (stagingTime > productionTime) {
@@ -92,15 +95,17 @@ pipeline {
                                     detectedBranchFromGit = 'production'
                                     echo "Detected production branch as most recently updated (within 5 min)"
                                 }
+                            } else {
+                                echo "Time difference (${timeDiff}s) is too large, using fallback method"
                             }
                         }
                         
-                        // Fallback: Try to get the most recently updated branch
+                        // Fallback: Try to get the most recently updated branch by commit date
                         if (!detectedBranchFromGit) {
                             def recentBranch = sh(script: 'git branch -r --sort=-committerdate | head -1 | sed "s|origin/||" | xargs || echo ""', returnStdout: true).trim()
                             if (recentBranch && (recentBranch == 'staging' || recentBranch == 'production')) {
                                 detectedBranchFromGit = recentBranch
-                                echo "Detected recently updated branch from Git: ${detectedBranchFromGit}"
+                                echo "Detected recently updated branch from Git (fallback): ${detectedBranchFromGit}"
                             }
                         }
                     } catch (Exception e) {
@@ -186,18 +191,25 @@ pipeline {
                             branchName = env.GITHUB_REF.replaceAll('refs/heads/', '')
                             echo "Branch detected from GITHUB_REF: ${env.GITHUB_REF} -> ${branchName}"
                         } else {
-                            // Last resort: Try to get branch from Git (if repo is already checked out)
+                            // Last resort: Use the most recently updated branch from remote (already fetched)
                             try {
-                                def gitBranch = sh(script: 'git rev-parse --abbrev-ref HEAD 2>/dev/null || echo ""', returnStdout: true).trim()
-                                if (gitBranch && gitBranch != 'HEAD' && gitBranch != '') {
-                                    branchName = gitBranch.replaceAll('origin/', '').replaceAll('remotes/origin/', '')
-                                    echo "Branch detected from Git checkout: ${branchName}"
+                                // Check which remote branch has the most recent commit
+                                def recentCommitBranch = sh(script: 'git for-each-ref --sort=-committerdate refs/remotes/origin/staging refs/remotes/origin/production --format="%(refname:short)" | head -1 | sed "s|origin/||" || echo ""', returnStdout: true).trim()
+                                if (recentCommitBranch && (recentCommitBranch == 'staging' || recentCommitBranch == 'production')) {
+                                    branchName = recentCommitBranch
+                                    echo "Branch detected from remote branch comparison: ${branchName}"
                                 } else {
-                                    // Try to detect from recent commits
-                                    def recentCommitBranch = sh(script: 'git log --all --oneline -1 --decorate | grep -oE "origin/(staging|production)" | head -1 | sed "s|origin/||" || echo ""', returnStdout: true).trim()
-                                    if (recentCommitBranch && (recentCommitBranch == 'staging' || recentCommitBranch == 'production')) {
-                                        branchName = recentCommitBranch
-                                        echo "Branch detected from recent commit: ${branchName}"
+                                    // Final fallback: compare commit dates directly
+                                    def stagingCommit = sh(script: 'git log -1 --format="%ct" origin/staging 2>/dev/null || echo "0"', returnStdout: true).trim()
+                                    def productionCommit = sh(script: 'git log -1 --format="%ct" origin/production 2>/dev/null || echo "0"', returnStdout: true).trim()
+                                    if (stagingCommit != '0' && productionCommit != '0') {
+                                        if (stagingCommit.toLong() > productionCommit.toLong()) {
+                                            branchName = 'staging'
+                                            echo "Branch detected from commit timestamp comparison: staging"
+                                        } else {
+                                            branchName = 'production'
+                                            echo "Branch detected from commit timestamp comparison: production"
+                                        }
                                     } else {
                                         branchName = 'production' // fallback
                                         echo "WARNING: No branch detected from environment variables or Git, defaulting to production"
