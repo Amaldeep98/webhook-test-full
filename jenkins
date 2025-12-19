@@ -58,6 +58,55 @@ pipeline {
                     def isAutoTriggered = false
                     def branchName = null
                     
+                    // Early Git fetch to detect branch from webhook push
+                    def detectedBranchFromGit = null
+                    try {
+                        echo "Attempting early Git fetch to detect pushed branch..."
+                        // Initialize git repo if needed and fetch all branches
+                        sh """
+                            if [ ! -d .git ]; then
+                                git init
+                                git remote add origin ${env.GIT_REPO_URL} || git remote set-url origin ${env.GIT_REPO_URL}
+                            fi
+                            git fetch origin --prune 2>&1 || true
+                        """
+                        // Check which branch was most recently updated by comparing commit dates
+                        def stagingDate = sh(script: 'git log -1 --format="%ct" origin/staging 2>/dev/null || echo "0"', returnStdout: true).trim()
+                        def productionDate = sh(script: 'git log -1 --format="%ct" origin/production 2>/dev/null || echo "0"', returnStdout: true).trim()
+                        
+                        echo "Staging last commit timestamp: ${stagingDate}"
+                        echo "Production last commit timestamp: ${productionDate}"
+                        
+                        if (stagingDate && productionDate) {
+                            def stagingTime = stagingDate.toLong()
+                            def productionTime = productionDate.toLong()
+                            // Check which branch was updated more recently (within last 5 minutes to account for webhook delay)
+                            def currentTime = System.currentTimeMillis() / 1000
+                            def timeDiff = Math.abs(currentTime - Math.max(stagingTime, productionTime))
+                            
+                            if (timeDiff < 300) { // Within 5 minutes
+                                if (stagingTime > productionTime) {
+                                    detectedBranchFromGit = 'staging'
+                                    echo "Detected staging branch as most recently updated (within 5 min)"
+                                } else if (productionTime > stagingTime) {
+                                    detectedBranchFromGit = 'production'
+                                    echo "Detected production branch as most recently updated (within 5 min)"
+                                }
+                            }
+                        }
+                        
+                        // Fallback: Try to get the most recently updated branch
+                        if (!detectedBranchFromGit) {
+                            def recentBranch = sh(script: 'git branch -r --sort=-committerdate | head -1 | sed "s|origin/||" | xargs || echo ""', returnStdout: true).trim()
+                            if (recentBranch && (recentBranch == 'staging' || recentBranch == 'production')) {
+                                detectedBranchFromGit = recentBranch
+                                echo "Detected recently updated branch from Git: ${detectedBranchFromGit}"
+                            }
+                        }
+                    } catch (Exception e) {
+                        echo "Early Git fetch failed (this is OK if repo doesn't exist yet): ${e.message}"
+                    }
+                    
                     def causes = currentBuild.getBuildCauses()
                     def isWebhookTrigger = false
                     def isManualTrigger = false
@@ -103,11 +152,12 @@ pipeline {
                         }
                     }
                     
-                    // Additional check: If BUILD_USER is not set but GIT_BRANCH is, it's likely a webhook
+                    // Additional check: If BUILD_USER is not set, it's likely a webhook (GitHub webhooks don't set BUILD_USER)
                     if (!isManualTrigger && !isWebhookTrigger) {
-                        if (!env.BUILD_USER && (env.GIT_BRANCH || env.BRANCH_NAME || env.GITHUB_REF)) {
+                        if (!env.BUILD_USER) {
+                            // No BUILD_USER means it's likely a webhook trigger
                             isWebhookTrigger = true
-                            echo "Webhook trigger detected (no BUILD_USER but Git branch info present)"
+                            echo "Webhook trigger detected (no BUILD_USER - typical for GitHub webhooks)"
                         } else if (env.BUILD_USER) {
                             isManualTrigger = true
                             echo "Manual trigger detected (BUILD_USER is set)"
@@ -122,8 +172,11 @@ pipeline {
                         // Auto-triggered build from webhook
                         isAutoTriggered = true
                         
-                        // Detect branch from Git - try multiple sources
-                        if (env.GIT_BRANCH) {
+                        // Detect branch from Git - try multiple sources (prioritize early Git fetch result)
+                        if (detectedBranchFromGit) {
+                            branchName = detectedBranchFromGit
+                            echo "Branch detected from early Git fetch: ${branchName}"
+                        } else if (env.GIT_BRANCH) {
                             branchName = env.GIT_BRANCH.replaceAll('origin/', '').replaceAll('refs/heads/', '')
                             echo "Branch detected from GIT_BRANCH: ${env.GIT_BRANCH} -> ${branchName}"
                         } else if (env.BRANCH_NAME) {
@@ -134,16 +187,22 @@ pipeline {
                             echo "Branch detected from GITHUB_REF: ${env.GITHUB_REF} -> ${branchName}"
                         } else {
                             // Last resort: Try to get branch from Git (if repo is already checked out)
-                            // Note: This might not work if no checkout has happened yet
                             try {
                                 def gitBranch = sh(script: 'git rev-parse --abbrev-ref HEAD 2>/dev/null || echo ""', returnStdout: true).trim()
                                 if (gitBranch && gitBranch != 'HEAD' && gitBranch != '') {
                                     branchName = gitBranch.replaceAll('origin/', '').replaceAll('remotes/origin/', '')
                                     echo "Branch detected from Git checkout: ${branchName}"
                                 } else {
-                                    branchName = 'production' // fallback
-                                    echo "WARNING: No branch detected from environment variables or Git, defaulting to production"
-                                    echo "This might indicate a webhook configuration issue"
+                                    // Try to detect from recent commits
+                                    def recentCommitBranch = sh(script: 'git log --all --oneline -1 --decorate | grep -oE "origin/(staging|production)" | head -1 | sed "s|origin/||" || echo ""', returnStdout: true).trim()
+                                    if (recentCommitBranch && (recentCommitBranch == 'staging' || recentCommitBranch == 'production')) {
+                                        branchName = recentCommitBranch
+                                        echo "Branch detected from recent commit: ${branchName}"
+                                    } else {
+                                        branchName = 'production' // fallback
+                                        echo "WARNING: No branch detected from environment variables or Git, defaulting to production"
+                                        echo "This might indicate a webhook configuration issue"
+                                    }
                                 }
                             } catch (Exception e) {
                                 branchName = 'production' // fallback
